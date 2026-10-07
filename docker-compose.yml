@@ -1,0 +1,144 @@
+# Ambiente local completo: PostgreSQL, Keycloak (IdP), LocalStack (SQS),
+# migrations e três instâncias independentes do wallet-service.
+#
+#   docker compose up --build
+#
+# Apenas as dependências (para testes de integração executados no host):
+#
+#   docker compose up -d postgres keycloak localstack
+
+x-app-env: &app-env
+  APP_ENV: local
+  LOG_LEVEL: info
+  HTTP_ADDR: ":8080"
+  DATABASE_URL: postgres://wallet_app:wallet_app@postgres:5432/wallet?sslmode=disable
+  OIDC_ISSUER_URL: http://keycloak:8080/realms/wagering
+  OIDC_JWKS_URL: http://keycloak:8080/realms/wagering/protocol/openid-connect/certs
+  OIDC_AUDIENCE: wallet-api
+  AWS_REGION: us-east-1
+  AWS_ENDPOINT_URL: http://localstack:4566
+  AWS_ACCESS_KEY_ID: wallet-service
+  AWS_SECRET_ACCESS_KEY: wallet-service-local-secret
+  SQS_WAGER_QUEUE_NAME: wager-transactions.fifo
+  SQS_WAGER_DLQ_NAME: wager-transactions-dlq.fifo
+  SQS_EVENTS_QUEUE_NAME: wallet-events.fifo
+  SQS_TRUSTED_PROVIDERS: provider-a,provider-b
+  PENDING_REFERENCE_TTL: 2m
+  PENDING_REFERENCE_MAX_ATTEMPTS: "12"
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: wallet-service:local
+  restart: unless-stopped
+  stop_grace_period: 30s
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    keycloak:
+      condition: service_healthy
+    localstack:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://localhost:8080/health/ready"]
+    interval: 5s
+    timeout: 3s
+    retries: 20
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./deploy/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres && psql -U postgres -tAc \"select 1 from pg_database where datname='wallet_test'\" | grep -q 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+      # O emissor (iss) é sempre http://keycloak:8080/realms/wagering, mesmo para
+      # tokens obtidos pelo host em http://localhost:8080.
+      KC_HOSTNAME: http://keycloak:8080
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HTTP_ENABLED: "true"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./deploy/keycloak/realm-wagering.json:/opt/keycloak/data/import/realm-wagering.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000 && printf 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+  localstack:
+    image: localstack/localstack:3.8
+    environment:
+      SERVICES: sqs,iam
+      AWS_DEFAULT_REGION: us-east-1
+      SQS_ENDPOINT_STRATEGY: path
+    ports:
+      - "4566:4566"
+    volumes:
+      - ./deploy/localstack/init-aws.sh:/etc/localstack/init/ready.d/init-aws.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal sqs get-queue-url --queue-name wallet-events.fifo >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: wallet-service:local
+    entrypoint: ["/app/migrate"]
+    command: ["up"]
+    environment:
+      MIGRATIONS_DATABASE_URL: postgres://wallet_owner:wallet_owner@postgres:5432/wallet?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  wallet-1:
+    <<: *app
+    environment:
+      <<: *app-env
+      INSTANCE_ID: wallet-1
+    ports:
+      - "8081:8080"
+
+  wallet-2:
+    <<: *app
+    environment:
+      <<: *app-env
+      INSTANCE_ID: wallet-2
+    ports:
+      - "8082:8080"
+
+  wallet-3:
+    <<: *app
+    environment:
+      <<: *app-env
+      INSTANCE_ID: wallet-3
+    ports:
+      - "8083:8080"
+
+volumes:
+  pgdata:

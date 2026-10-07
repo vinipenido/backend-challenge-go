@@ -1,0 +1,13 @@
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Binários e artefatos locais
+/bin/
+*.test
+*.out
+coverage.*
+
+# Variáveis locais (use .env.example como modelo)
+.env
